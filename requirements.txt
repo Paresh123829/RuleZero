@@ -1,0 +1,9 @@
+Flask>=2.2,<3
+Flask-Cors
+python-dotenv
+pymongo[srv]
+flask-jwt-extended>=4.7.1,<5
+passlib[bcrypt]
+pillow
+gunicorn
+requests
