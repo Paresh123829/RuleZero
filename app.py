@@ -1,0 +1,1024 @@
+import os
+import re
+import uuid
+import time
+import logging
+import warnings
+from datetime import datetime
+from dataclasses import asdict
+from PIL import Image, ExifTags
+
+from flask import Flask, render_template, request, jsonify
+from openai import OpenAI
+import os
+from dotenv import load_dotenv
+
+from flask import Flask, request, jsonify, render_template, redirect, url_for, flash, session
+from flask_cors import CORS
+from dotenv import load_dotenv
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt
+from werkzeug.utils import secure_filename
+
+from ai.image_classifier import ImageIssueClassifier
+from ai.nlp import ComplaintNLPAnalyzer
+from ai.fake_detection import FakeReportDetector
+from ai.complaint_writer import ComplaintWriter
+from ai.voice_processor import VoiceProcessor
+from ai.news_monitor import NewsMonitor
+from ai.gamification import GamificationSystem
+from storage.db import CivicDB, ReportRecord
+from utils.gps import normalize_location
+from background_tasks import task_manager
+
+def extract_gps_from_image(image_path):
+    """Extract GPS coordinates from image EXIF data"""
+    try:
+        with Image.open(image_path) as img:
+            exif = img._getexif()
+            if exif is not None:
+                for tag, value in exif.items():
+                    tag_name = ExifTags.TAGS.get(tag, tag)
+                    if tag_name == 'GPSInfo':
+                        gps_data = value
+                        lat = gps_data.get(2)
+                        lat_ref = gps_data.get(1)
+                        lon = gps_data.get(4)
+                        lon_ref = gps_data.get(3)
+                        
+                        if lat and lon:
+                            # Convert to decimal degrees
+                            lat_decimal = lat[0] + lat[1]/60 + lat[2]/3600
+                            lon_decimal = lon[0] + lon[1]/60 + lon[2]/3600
+                            
+                            if lat_ref == 'S':
+                                lat_decimal = -lat_decimal
+                            if lon_ref == 'W':
+                                lon_decimal = -lon_decimal
+                                
+                            return lat_decimal, lon_decimal
+    except Exception:
+        pass
+    return None, None
+
+
+
+# Optional OpenAI client (SDK v1). Falls back to rule-based replies if unavailable.
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
+
+_openai_client_cache = None
+
+def _get_openai_client():
+    global _openai_client_cache
+    if _openai_client_cache is not None:
+        return _openai_client_cache
+    if OpenAI is None:
+        return None
+    # Only create if key is present
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    try:
+        _openai_client_cache = OpenAI()
+        return _openai_client_cache
+    except Exception:
+        return None
+
+# Configure logging (default INFO). Allow override via LOG_LEVEL env.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(level=numeric_level)
+
+# Suppress noisy third-party loggers
+for noisy in [
+    "urllib3",
+    "httpx",
+    "huggingface_hub",
+    "transformers",
+]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
+# Re-enable Werkzeug request/startup info logs
+logging.getLogger("werkzeug").setLevel(logging.INFO)
+
+# Aggressively silence PyMongo and Passlib internal debug spam
+for noisy_exact in [
+    "pymongo",
+    "pymongo.topology",
+    "pymongo.connection",
+    "pymongo.serverSelection",
+    "pymongo.command",
+    "passlib",
+    "passlib.handlers.bcrypt",
+]:
+    lg = logging.getLogger(noisy_exact)
+    lg.setLevel(logging.ERROR)
+    lg.propagate = False
+    for h in lg.handlers:
+        h.setLevel(logging.ERROR)
+
+# Filter runtime warnings from passlib/bcrypt
+warnings.filterwarnings("ignore", module=r"passlib.*")
+
+# Fallback env-based verbosity for Transformers
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+try:
+    # Reduce Transformers internal logging further
+    from transformers.utils import logging as hf_logging
+    hf_logging.set_verbosity_error()
+except Exception:
+    pass
+
+# Load environment variables
+load_dotenv()
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+    
+    # Configuration
+    app.secret_key = os.environ.get("SESSION_SECRET", "civic-eye-secret-key-change-me")
+    upload_dir = os.getenv("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "uploads"))
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    # Ensure static folder exists
+    static_folder = app.static_folder or 'static'
+    os.makedirs(static_folder, exist_ok=True)
+    os.makedirs(os.path.join(static_folder, 'css'), exist_ok=True)
+    os.makedirs(os.path.join(static_folder, 'js'), exist_ok=True)
+    os.makedirs(os.path.join(static_folder, 'images'), exist_ok=True)
+    
+    # CORS configuration
+    allowed_origins = os.getenv("ALLOWED_ORIGINS", "*")
+    CORS(app, resources={r"/api/*": {"origins": allowed_origins.split(",")}})
+    
+    # JWT configuration
+    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-me")
+    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 60 * 60 * 8  # 8 hours
+    jwt = JWTManager(app)
+    
+    # File upload configuration
+    app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+    AUDIO_EXTENSIONS = {'wav', 'mp3', 'ogg', 'm4a'}
+    def allowed_file(filename):
+        return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    
+    def allowed_audio(filename):
+        return '.' in filename and filename.rsplit('.', 1)[1].lower() in AUDIO_EXTENSIONS
+
+    # Initialize services
+    classifier = ImageIssueClassifier()
+    nlp = ComplaintNLPAnalyzer()
+    fake_detector = FakeReportDetector()
+    voice_processor = VoiceProcessor()
+    news_monitor = NewsMonitor()
+    gamification = GamificationSystem()
+    # Load Groq API key from .env file
+    groq_key = " "
+    writer = ComplaintWriter(api_key=groq_key)
+    db = CivicDB()
+    
+    # Start background tasks
+    task_manager.start_background_tasks()
+    
+    # Routes
+    @app.context_processor
+    def inject_cache_buster():
+        # Use app start time so all static links change per restart
+        return {"cache_buster": int(time.time())}
+    @app.route('/')
+    def index():
+        return render_template('index.html')
+    
+    # Role selection routes
+    @app.route('/login')
+    def login_page():
+        return redirect(url_for('login_role_selection'))
+    
+    @app.route('/signup')
+    def signup_page():
+        return redirect(url_for('signup_role_selection'))
+    
+    @app.route('/login/select')
+    def login_role_selection():
+        return render_template('role_selection.html', action='login', target_route='login_page_role')
+    
+    @app.route('/signup/select')
+    def signup_role_selection():
+        return render_template('role_selection.html', action='sign up', target_route='signup_page_role')
+    
+    @app.route('/login/<role>')
+    def login_page_role(role):
+        return render_template('login.html', role=role)
+    
+    @app.route('/signup/<role>')
+    def signup_page_role(role):
+        return render_template('signup.html', role=role)
+    
+    @app.route('/home')
+    def home():
+        if 'user' not in session:
+            return redirect(url_for('login_page'))
+        
+        # Check if logged-in user is banned
+        username = session.get('user', {}).get('username')
+        if username:
+            try:
+                civic_points = db.get_user_points(username)
+                if gamification.is_permanently_banned(civic_points):
+                    session.pop('user', None)
+                    flash('Your account has been permanently banned. You have been logged out.', 'error')
+                    return redirect(url_for('login_page'))
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Ban check error: {e}")
+        
+        return render_template('home.html', user=session.get('user'))
+    
+    @app.route('/report')
+    def report_page():
+        if 'user' not in session:
+            return redirect(url_for('login_page'))
+        
+        # Admins cannot report issues - they only manage
+        if session.get('user', {}).get('role') == 'admin':
+            flash('Admins cannot report issues. You can only manage complaints from the Admin Dashboard.')
+            return redirect(url_for('admin_page'))
+        
+        return render_template('report.html')
+    
+    @app.route('/track')
+    def track_page():
+        return render_template('track.html')
+    
+    @app.route('/solutions')
+    def solutions_page():
+        return render_template('solutions.html')
+    
+    @app.route('/resources')
+    def resources_page():
+        return render_template('resources.html')
+    
+    # New: Map View
+    @app.route('/map')
+    def map_view_page():
+        return render_template('map.html')
+
+    @app.route('/about')
+    def about_page():
+        return render_template('about.html')
+    
+    @app.route('/contact')
+    def contact_page():
+        return render_template('contact.html')
+    
+    @app.route('/profile')
+    def profile_page():
+        if 'user' not in session:
+            return redirect(url_for('login_page'))
+        
+        username = session.get('user', {}).get('username')
+        user_role = session.get('user', {}).get('role')
+        
+        # Admin gets different profile - user management
+        if user_role == 'admin':
+            users_with_stats = db.get_all_users_with_stats()
+            return render_template('admin_profile.html', 
+                                 user=session.get('user'),
+                                 all_users=users_with_stats)
+        
+        # Regular user profile
+        user_data = db.find_user(username)
+        
+        if user_data:
+            try:
+                # Get user reports and calculate stats
+                user_reports = db.get_user_reports(username)
+                civic_points = db.get_user_points(username)
+                
+                # Calculate stats for gamification
+                total_complaints = len(user_reports)
+                resolved_complaints = len([r for r in user_reports if r.status == 'resolved'])
+                fake_complaints = len([r for r in user_reports if r.fake])
+                pending_complaints = len([r for r in user_reports if r.status in ['submitted', 'in_progress']])
+                
+                # Update user_data with calculated stats
+                user_data_with_stats = user_data.copy()
+                user_data_with_stats.update({
+                    'points': civic_points,
+                    'total_complaints': total_complaints,
+                    'resolved_complaints': resolved_complaints,
+                    'fake_complaints': fake_complaints,
+                    'pending_complaints': pending_complaints
+                })
+                
+                # Get gamification stats
+                stats = gamification.get_user_stats_summary(user_data_with_stats)
+                badges = gamification.get_badges(user_data_with_stats)
+                
+                return render_template('profile.html', 
+                                     user=session.get('user'),
+                                     stats=stats,
+                                     badges=badges,
+                                     recent_complaints=user_reports[:10])
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Profile gamification error: {e}")
+                # Fallback to basic profile
+                return render_template('profile.html', 
+                                     user=session.get('user'),
+                                     stats=None,
+                                     badges=[],
+                                     recent_complaints=[])
+        
+        return render_template('profile.html', user=session.get('user'))
+    
+    @app.route('/admin')
+    def admin_page():
+        if 'user' not in session or session.get('user', {}).get('role') != 'admin':
+            flash('Access denied. Admin privileges required.')
+            return redirect(url_for('home'))
+        
+        # Get all users with their statistics (exclude admins from user list)
+        all_users = db.get_all_users_with_stats()
+        users_with_stats = [u for u in all_users if u.get('role') != 'admin']
+        
+        # Get all reports from non-admin users only
+        all_reports = db.list_reports(limit=200)
+        user_reports = [r for r in all_reports if r.username and db.find_user(r.username) and db.find_user(r.username).get('role') != 'admin']
+        
+        # Calculate overall statistics
+        total_users = len(users_with_stats)
+        total_reports = len(user_reports)
+        total_resolved = len([r for r in user_reports if r.status == 'resolved'])
+        total_pending = len([r for r in user_reports if r.status in ['submitted', 'in_progress']])
+        total_fake = len([r for r in user_reports if r.fake])
+        
+        return render_template('admin.html', 
+                             users=users_with_stats,
+                             reports=user_reports,
+                             total_users=total_users,
+                             total_reports=total_reports,
+                             total_resolved=total_resolved,
+                             total_pending=total_pending,
+                             total_fake=total_fake)
+    
+    # Redirect old authority dashboard to admin
+    @app.route('/authority_dashboard')
+    def authority_dashboard():
+        return redirect(url_for('admin_page'))
+    
+    # Authentication routes
+    @app.route('/auth/login', methods=['POST'])
+    def login():
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        if not username or not password:
+            flash('Username and password are required')
+            return redirect(url_for('login_page'))
+        
+        user = db.find_user(username)
+        if not user or not db.verify_password(user, password):
+            flash('Invalid credentials')
+            return redirect(url_for('login_page'))
+        
+        # Check if user is permanently banned
+        try:
+            civic_points = db.get_user_points(user['username'])
+            if gamification.is_permanently_banned(civic_points):
+                flash('Your account has been permanently banned due to excessive fake complaints. This account cannot be used anymore.', 'error')
+                return redirect(url_for('login_page'))
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Ban check error: {e}")
+        
+        session['user'] = {
+            'username': user['username'],
+            'role': user.get('role', 'citizen')
+        }
+        
+        flash(f'Welcome back, {username}!')
+        return redirect(url_for('home'))
+    
+    @app.route('/dashboard')
+    def dashboard():
+        if 'user' not in session:
+            return redirect(url_for('login_page'))
+        
+        username = session.get('user', {}).get('username')
+        
+        # Get real data from database
+        try:
+            user_reports = db.get_user_reports(username) or []
+            civic_points = db.get_user_points(username) or 0
+            leaderboard = db.get_leaderboard(limit=10) or []
+            notifications = db.get_user_notifications(username) or []
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Dashboard DB error: {e}")
+            user_reports = []
+            civic_points = 0
+            leaderboard = []
+            notifications = []
+        
+        return render_template('dashboard.html', 
+                             user=session.get('user'),
+                             reports=user_reports,
+                             civic_points=civic_points,
+                             leaderboard=leaderboard,
+                             notifications=notifications)
+
+    @app.route('/auth/signup', methods=['POST'])
+    def signup():
+        name = request.form.get('name')
+        username = request.form.get('username')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        role = request.form.get('role', 'citizen')
+        
+        # Normalize role: convert 'user' to 'citizen', keep 'admin'
+        if role == 'user':
+            role = 'citizen'
+        
+        if not all([name, username, email, password]):
+            flash('All fields are required', 'error')
+            return redirect(url_for('signup_page'))
+        
+        # Ensure DB connectivity
+        if not db.is_connected():
+            flash('Database connection error. Please check MONGODB_URI/MONGODB_DB.', 'error')
+            return redirect(url_for('signup_page'))
+        
+        # Check if user exists
+        if db.find_user(username):
+            flash('Username already exists', 'error')
+            return redirect(url_for('signup_page'))
+        
+        # Create user with role
+        success = db.create_user(username, email, password, name, role)
+        if success:
+            flash(f'Account created successfully! Please login', 'success')
+            return redirect(url_for('login_page_role', role='admin' if role == 'admin' else 'user'))
+        else:
+            flash('Error creating account', 'error')
+            return redirect(url_for('signup_page_role', role='admin' if role == 'admin' else 'user'))
+    
+    @app.route('/auth/logout')
+    def logout():
+        session.pop('user', None)
+        flash('You have been logged out')
+        return redirect(url_for('index'))
+    
+    # Alias for authority dashboard logout
+    @app.route('/auth_logout')
+    def auth_logout():
+        return logout()
+    
+    # Issue reporting route
+    @app.route('/submit_report', methods=['POST'])
+    def submit_report():
+        if 'user' not in session:
+            flash('Please login to submit reports')
+            return redirect(url_for('login_page'))
+        
+        username = session.get('user', {}).get('username')
+        user_data = db.find_user(username)
+        
+        if not user_data:
+            flash('User not found')
+            return redirect(url_for('login_page'))
+        
+        # Check if user can register complaint (gamification check)
+        try:
+            civic_points = db.get_user_points(username)
+            user_reports = db.get_user_reports(username)
+            pending_count = len([r for r in user_reports if r.status in ['submitted', 'in_progress']])
+            can_register, message = gamification.can_register_complaint(civic_points, pending_count)
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Gamification check error: {e}")
+            can_register, message = True, "Gamification check failed, allowing registration"
+        
+        if not can_register:
+            flash(message, 'error')
+            return redirect(url_for('report_page'))
+        
+        text = request.form.get('description')
+        latitude = request.form.get('latitude')
+        longitude = request.form.get('longitude')
+        issue_type_manual = request.form.get('issue_type')
+        language = request.form.get('language', 'english')
+        
+        # Process voice input if provided
+        voice_text = None
+        if 'voice' in request.files:
+            voice_file = request.files['voice']
+            if voice_file and voice_file.filename and allowed_audio(voice_file.filename):
+                voice_filename = secure_filename(voice_file.filename)
+                voice_name, voice_ext = os.path.splitext(voice_filename)
+                voice_filename = f"{voice_name}_{uuid.uuid4().hex[:8]}{voice_ext}"
+                voice_path = os.path.join(upload_dir, voice_filename)
+                voice_file.save(voice_path)
+                
+                # Process voice
+                voice_result = voice_processor.process_audio_file(voice_path)
+                voice_text = voice_result.get('original_text', '')
+                if not text and voice_text:
+                    text = voice_text  # Use voice as primary text if no typed text
+                elif voice_text:
+                    text = f"{text} [Voice: {voice_text}]"  # Append voice text
+        
+        image_path = None
+        if 'image' in request.files:
+            file = request.files['image']
+            if file and file.filename and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                # Add UUID to prevent conflicts
+                name, ext = os.path.splitext(filename)
+                filename = f"{name}_{uuid.uuid4().hex[:8]}{ext}"
+                image_path = os.path.join(upload_dir, filename)
+                file.save(image_path)
+                # If lat/lon not provided, try EXIF
+                if not latitude or not longitude:
+                    exif_lat, exif_lon = extract_gps_from_image(image_path)
+                    if exif_lat is not None and exif_lon is not None:
+                        latitude = str(exif_lat)
+                        longitude = str(exif_lon)
+        
+        # AI: classify and analyze
+        predicted_issue = None
+        if image_path:
+            predicted_issue = classifier.classify_image(image_path)
+            
+            # Validation: If image is uploaded, pothole must be detected
+            if predicted_issue != "pothole":
+                # Clean up the uploaded image file
+                try:
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Failed to delete image file: {e}")
+                
+                # Reject submission if no pothole detected
+                if predicted_issue is None:
+                    flash('No pothole detected in the uploaded image. Please upload an image with a visible pothole to submit your complaint.', 'error')
+                else:
+                    flash(f'No pothole detected in the uploaded image. Detected issue: {predicted_issue}. Please upload an image with a visible pothole to submit your complaint.', 'error')
+                return redirect(url_for('report_page'))
+        
+        analysis = nlp.analyze(text or "")
+        nlp_issue = analysis.get("issue_type")
+        
+        # Pick best guess issue type (manual > AI > NLP > unknown)
+        issue_type = issue_type_manual or predicted_issue or nlp_issue or "unknown"
+        
+        # Fake / duplicate detection
+        recent = [asdict(r) for r in db.list_reports(limit=50)]
+        is_fake, fake_score = fake_detector.is_fake(
+            text=text or "",
+            image_path=image_path,
+            latitude=latitude,
+            longitude=longitude,
+            recent_reports=recent,
+        )
+        
+        # Normalize location
+        location = normalize_location(latitude, longitude)
+        
+        # Generate complaint
+        complaint_text = writer.generate(
+            issue_type=issue_type,
+            description=text or "",
+            location=location,
+            language=language
+        )
+        
+        # Persist
+        report_id = uuid.uuid4().hex[:8]
+        record = ReportRecord(
+            report_id=report_id,
+            created_at=datetime.utcnow().isoformat() + "Z",
+            issue_type=issue_type,
+            text=text,
+            voice_text=voice_text,
+            image_path=image_path,
+            location=location,
+            complaint_text=complaint_text,
+            status="submitted",
+            fake=is_fake,
+            fake_score=fake_score,
+            username=username,
+        )
+        
+        logging.getLogger(__name__).info(f"Generated report ID: {report_id}")
+        save_success = db.save_report(record)
+        logging.getLogger(__name__).info(f"Report save result: {save_success}")
+        
+        # Update user statistics (simplified for now)
+        if save_success:
+            logging.getLogger(__name__).info(f"Report saved successfully for user: {username}")
+        
+        if is_fake:
+            flash(f'Report submitted but flagged for review. Complaint ID: {report_id}')
+        else:
+            flash(f'Report submitted successfully! Complaint ID: {report_id} (Copy this ID to track your complaint)')
+        
+        return redirect(url_for('track_page'))
+    
+    # Complaint tracking route
+    @app.route('/check_status', methods=['POST'])
+    def check_status():
+        complaint_id = request.form.get('complaint_id')
+        if not complaint_id:
+            flash('Please enter a complaint ID')
+            return redirect(url_for('track_page'))
+        
+        # Clean the complaint ID (remove spaces, convert to lowercase if needed)
+        complaint_id = complaint_id.strip()
+        logging.getLogger(__name__).info(f"Tracking complaint ID: '{complaint_id}' (length: {len(complaint_id)})")
+        
+        record = db.get_report(complaint_id)
+        if not record:
+            flash(f'Complaint not found: {complaint_id}')
+            return redirect(url_for('track_page'))
+        
+        return render_template('track.html', record=record)
+    
+    # Admin status update route
+    @app.route('/update_status', methods=['POST'])
+    def update_status():
+        if 'user' not in session or session.get('user', {}).get('role') != 'admin':
+            flash('Access denied')
+            return redirect(url_for('home'))
+        
+        report_id = request.form.get('report_id')
+        new_status = request.form.get('status')
+        
+        if not report_id or not new_status:
+            flash('Report ID and status are required')
+            return redirect(url_for('admin_page'))
+        
+        # Get the report to find the user
+        report = db.get_report(report_id)
+        old_status = report.status if report else None
+        
+        success = db.update_status(report_id, new_status)
+        if success:
+            flash('Status updated successfully')
+            
+            # Update user points and stats based on status change
+            if report and report.username:
+                _update_user_gamification(report.username, old_status, new_status, report.fake)
+        else:
+            flash('Failed to update status')
+        
+        return redirect(url_for('admin_page'))
+    
+    # API Routes (for AJAX calls if needed)
+    @app.route('/api/health')
+    def api_health():
+        return jsonify({"status": "ok"})
+
+    @app.route('/api/detect', methods=['POST'])
+    def api_detect():
+        """Run image detection on an uploaded file and return annotated preview URL + predicted issue."""
+        if 'image' not in request.files:
+            return jsonify({"error": "no_image"}), 400
+        file = request.files['image']
+        if not file or not file.filename:
+            return jsonify({"error": "empty"}), 400
+        # Validate extension
+        ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+        def allowed_file(filename):
+            return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+        if not allowed_file(file.filename):
+            return jsonify({"error": "unsupported_type"}), 400
+
+        # Save temp upload
+        temp_name = f"detect_{uuid.uuid4().hex[:8]}_{secure_filename(file.filename)}"
+        temp_path = os.path.join(upload_dir, temp_name)
+        file.save(temp_path)
+
+        info = classifier.classify_with_preview(temp_path)
+        if not info:
+            return jsonify({"issue_type": None, "preview_url": None})
+
+        # Map preview path (on disk) to static URL
+        preview_path = info.get('preview_path') or ''
+        static_root = os.path.abspath(app.static_folder)
+        try:
+            rel = os.path.relpath(preview_path, static_root).replace('\\', '/')
+            preview_url = url_for('static', filename=rel)
+        except Exception:
+            preview_url = None
+
+        return jsonify({
+            "issue_type": info.get('issue_type'),
+            "preview_url": preview_url,
+            "original": os.path.basename(temp_path)
+        })
+
+    @app.route('/api/db_health')
+    def api_db_health():
+        return jsonify({"connected": db.is_connected()})
+    
+    @app.route('/api/reports')
+    def api_reports():
+        reports = db.list_reports(limit=100)
+        return jsonify([asdict(r) for r in reports])
+    
+    @app.route('/api/status/<report_id>')
+    def api_status(report_id):
+        record = db.get_report(report_id)
+        if not record:
+            return jsonify({"error": "not_found"}), 404
+        return jsonify(asdict(record))
+    
+    @app.route('/api/news_issues', methods=['POST'])
+    def api_news_issues():
+        """Get civic issues from recent news and social media"""
+        try:
+            # Get fresh news from background task cache
+            issues = task_manager.get_fresh_news()
+            return jsonify({
+                "issues": issues, 
+                "sources": ["news", "twitter", "reddit"],
+                "last_updated": task_manager.last_update.isoformat() if task_manager.last_update else None
+            })
+        except Exception as e:
+            logging.getLogger(__name__).error(f"News API error: {e}")
+            return jsonify({"error": "failed_to_fetch_news", "issues": []}), 500
+    
+    @app.route('/api/voice_process_async', methods=['POST'])
+    def api_voice_process_async():
+        """Voice processing endpoint with better error handling"""
+        try:
+            if 'audio' not in request.files:
+                return jsonify({"success": False, "error": "no_audio"}), 400
+            
+            audio_file = request.files['audio']
+            if not audio_file or not audio_file.filename:
+                return jsonify({"success": False, "error": "empty_audio"}), 400
+            
+            # Save and convert audio file
+            temp_name = f"voice_{uuid.uuid4().hex[:8]}.wav"
+            temp_path = os.path.join(upload_dir, temp_name)
+            
+            # Save original file first
+            audio_file.save(temp_path)
+            
+            # Convert to WAV if needed
+            if not temp_path.lower().endswith('.wav'):
+                try:
+                    import pydub
+                    audio = pydub.AudioSegment.from_file(temp_path)
+                    wav_path = temp_path.replace(os.path.splitext(temp_path)[1], '.wav')
+                    audio.export(wav_path, format='wav')
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    temp_path = wav_path
+                except ImportError:
+                    logger.warning("pydub not available for audio conversion")
+                except Exception as e:
+                    logger.warning(f"Audio conversion failed: {e}")
+            
+            # Process voice
+            result = voice_processor.process_audio_file(temp_path)
+            
+            # Cleanup
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except:
+                pass
+            
+            text = result.get('original_text', '').strip()
+            analysis = result.get('analysis', {})
+            
+            if text and len(text) > 0:
+                # Use analyzed complaint summary if available
+                display_text = analysis.get('complaint_summary', text) if analysis else text
+                
+                return jsonify({
+                    "success": True,
+                    "text": display_text,
+                    "original_text": text,
+                    "language": result.get('detected_language', 'unknown'),
+                    "confidence": result.get('confidence', 0.7),
+                    "processing_time": result.get('processing_time', 1.0),
+                    "issue_type": analysis.get('issue_type', 'unknown'),
+                    "location": analysis.get('location'),
+                    "urgency": analysis.get('urgency', 'medium'),
+                    "keywords": analysis.get('keywords', [])
+                })
+            else:
+                return jsonify({
+                    "success": False,
+                    "error": "no_speech_detected",
+                    "message": "No speech detected. Please ensure audio is clear and contains speech."
+                })
+                
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Voice processing error: {e}")
+            return jsonify({
+                "success": False,
+                "error": "processing_failed",
+                "message": "Voice recognition failed. Try speaking more clearly."
+            }), 500
+    
+    @app.route('/api/update_status', methods=['POST'])
+    def api_update_status():
+        """Update complaint status via API"""
+        if 'user' not in session or session.get('user', {}).get('role') != 'admin':
+            return jsonify({"error": "unauthorized"}), 403
+        
+        data = request.get_json()
+        report_id = data.get('report_id')
+        new_status = data.get('status')
+        
+        if not report_id or not new_status:
+            return jsonify({"error": "missing_data"}), 400
+        
+        # Get the report to find the user
+        report = db.get_report(report_id)
+        old_status = report.status if report else None
+        
+        success = db.update_status(report_id, new_status)
+        
+        if success:
+            logging.getLogger(__name__).info(f"Status updated: {report_id} -> {new_status}")
+            
+            # Update user points and stats based on status change
+            if report and report.username:
+                _update_user_gamification(report.username, old_status, new_status, report.fake)
+            
+            return jsonify({"success": True})
+        else:
+            return jsonify({"error": "update_failed"}), 500
+    
+    @app.route('/api/adjust_points', methods=['POST'])
+    def api_adjust_points():
+        """Admin endpoint to manually adjust user points"""
+        if 'user' not in session or session.get('user', {}).get('role') != 'admin':
+            return jsonify({"error": "unauthorized"}), 403
+        
+        data = request.get_json()
+        username = data.get('username')
+        points_delta = data.get('points_delta')
+        
+        if not username or points_delta is None:
+            return jsonify({"error": "missing_data"}), 400
+        
+        try:
+            points_delta = int(points_delta)
+        except ValueError:
+            return jsonify({"error": "invalid_points"}), 400
+        
+        success = db.adjust_user_points(username, points_delta)
+        
+        if success:
+            new_points = db.get_user_points(username)
+            logging.getLogger(__name__).info(f"Admin adjusted points for {username}: {points_delta:+d}, new total: {new_points}")
+            return jsonify({"success": True, "new_points": new_points})
+        else:
+            return jsonify({"error": "update_failed"}), 500
+    
+    @app.route('/api/delete_complaint', methods=['POST'])
+    def api_delete_complaint():
+        """Admin endpoint to delete a complaint"""
+        if 'user' not in session or session.get('user', {}).get('role') != 'admin':
+            return jsonify({"error": "unauthorized"}), 403
+        
+        data = request.get_json()
+        report_id = data.get('report_id')
+        
+        if not report_id:
+            return jsonify({"error": "missing_data"}), 400
+        
+        success = db.delete_report(report_id)
+        
+        if success:
+            logging.getLogger(__name__).info(f"Admin deleted complaint: {report_id}")
+            return jsonify({"success": True})
+        else:
+            return jsonify({"error": "delete_failed"}), 500
+    
+    def _update_user_gamification(username: str, old_status: str, new_status: str, is_fake: bool):
+        """Helper function to update user gamification stats when status changes"""
+        try:
+            stat_updates = {}
+            points_delta = 0
+            
+            # When complaint moves from pending to resolved
+            if old_status in ['submitted', 'in_progress'] and new_status == 'resolved':
+                stat_updates['resolved_complaints'] = 1
+                stat_updates['pending_complaints'] = -1
+                
+                # Award points for resolved complaint (only if not fake)
+                if not is_fake:
+                    points_delta = 10  # Fixed 10 points for resolved complaint
+                    logging.getLogger(__name__).info(f"Awarding {points_delta} points to {username} for resolved complaint")
+            
+            # When complaint moves to in_progress (no point change, just tracking)
+            elif old_status == 'submitted' and new_status == 'in_progress':
+                # No stat changes needed, still pending
+                pass
+            
+            # When complaint is rejected/closed without resolution
+            elif old_status in ['submitted', 'in_progress'] and new_status in ['rejected', 'closed']:
+                stat_updates['pending_complaints'] = -1
+                # No points awarded for rejected complaints
+            
+            # Apply updates (simplified for now)
+            if points_delta != 0:
+                logging.getLogger(__name__).info(f"Points delta for {username}: {points_delta}")
+                
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Error updating gamification for {username}: {e}")
+    
+    # Chatbot route
+    @app.route('/chatbot', methods=['POST'])
+    def chatbot_reply():
+        try:
+            payload = request.get_json(silent=True) or {}
+            message = (payload.get('message') or '').strip()
+            if not message:
+                return jsonify({"reply": "Please type a message."})
+
+            txt = message.lower()
+
+            # Simple intents/FAQ (ordered: more specific first)
+            responses = [
+                (['status', 'track', 'tracking'], "Use the Track page and enter your complaint ID to see the latest status."),
+                (['report', 'complaint', 'file'], "To file a complaint, go to Report Issue, add a description, optional photo, and location, then submit."),
+                (['login', 'signup', 'account'], "Use the Login/Sign Up pages in the header. Passwords are stored securely."),
+                (['map'], "The Map View shows recent issues pinned to their locations."),
+                (['mongodb', 'mongo'], "This app uses MongoDB Atlas. Configure MONGODB_URI and MONGODB_DB in the .env file to connect."),
+                (['admin'], "Admins and authorities can review and update statuses from the Admin page."),
+                (['hello', 'hi', 'hey'], "Hello! How can I help you with Civic Eye today?"),
+                (['help', 'support'], "You can report issues via 'Report Issue', track them under 'Track', or view insights on the dashboard."),
+            ]
+
+            def any_keyword_in_text(text: str, keywords: list[str]) -> bool:
+                for k in keywords:
+                    if re.search(r"\b" + re.escape(k) + r"\b", text):
+                        return True
+                return False
+
+            for keywords, reply in responses:
+                if any_keyword_in_text(txt, keywords):
+                    return jsonify({"reply": reply})
+
+            # If OpenAI is configured and SDK is available, generate an AI answer
+            _openai_client = _get_openai_client()
+            if _openai_client:
+                debug = os.getenv("CHATBOT_DEBUG") == "1"
+                try:
+                    system_prompt = (
+                        "You are Civic Eye, a concise assistant for a civic issue reporting web app. "
+                        "Answer user questions about reporting issues, tracking complaints, authentication, map view, and general guidance. "
+                        "If asked something outside app scope, politely provide a brief helpful answer. Keep replies under 6 lines."
+                    )
+                    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+                    # Try the Responses API first
+                    try:
+                        resp = _openai_client.responses.create(
+                            model=model,
+                            input=f"System: {system_prompt}\nUser: {message}"
+                        )
+                        ai_text = getattr(resp, "output_text", None) or str(resp)
+                        ai_text = ai_text.strip()[:1200]
+                        if debug:
+                            ai_text = "[AI:responses] " + ai_text
+                        return jsonify({"reply": ai_text})
+                    except Exception as inner:
+                        logging.getLogger(__name__).info("Responses API failed, trying Chat Completions: %s", inner)
+
+                    # Fallback: Chat Completions API (older SDKs)
+                    try:
+                        chat = _openai_client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": message},
+                            ],
+                            temperature=0.5,
+                        )
+                        ai_text = (chat.choices[0].message.content or "").strip()[:1200]
+                        if debug:
+                            ai_text = "[AI:chat] " + ai_text
+                        return jsonify({"reply": ai_text})
+                    except Exception as inner2:
+                        logging.getLogger(__name__).warning("OpenAI chat completion failed: %s", inner2)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("OpenAI reply failed: %s", exc)
+
+            # Default fallback
+            return jsonify({"reply": "I didn't catch that. You can ask about reporting, tracking status, map view, login/signup, or MongoDB setup."})
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Chatbot error: %s", exc)
+            return jsonify({"reply": "Sorry, something went wrong handling your message."}), 200
+    
+    return app
+
+# Create the app
+app = create_app()
